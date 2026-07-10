@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Claude CLI — pinned by version so review behavior is stable across
 # rebuilds. Bump alongside review.sh changes when Anthropic ships new CLI
 # flags we want.
-ARG CLAUDE_CLI_VERSION=2.0.13
+ARG CLAUDE_CLI_VERSION=2.1.197
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CLI_VERSION} \
     && npm cache clean --force
 

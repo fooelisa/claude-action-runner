@@ -39,6 +39,7 @@ case "$GITHUB_API_URL" in
 esac
 echo "::group::setup"
 echo "forge=$FORGE  repo=$GITHUB_REPOSITORY  pr=$PR_NUMBER"
+echo "claude CLI: $(claude --version 2>&1 || echo unavailable)"
 echo "::endgroup::"
 
 # ---------- 1. fetch PR metadata ----------
@@ -176,14 +177,32 @@ trap 'kill $HEARTBEAT_PID 2>/dev/null || true' EXIT
 echo "::group::claude call"
 # --output-format json wraps the model's textual response in a metadata envelope.
 # We ask the model to make its response itself be valid JSON, then double-parse.
-CLAUDE_RESPONSE=$(printf '%s' "$PROMPT" | claude -p --output-format json)
+#
+# Capture stderr separately so failures surface a usable diagnostic in the
+# workflow log. Without this, `set -o pipefail` kills the script on a
+# non-zero claude exit and we never see WHY it failed.
+CLAUDE_STDERR=$(mktemp)
+if ! CLAUDE_RESPONSE=$(printf '%s' "$PROMPT" | claude -p --output-format json 2>"$CLAUDE_STDERR"); then
+  CLAUDE_EXIT=$?
+  echo "ERROR: claude CLI exit $CLAUDE_EXIT" >&2
+  echo "--- claude stderr ---" >&2
+  cat "$CLAUDE_STDERR" >&2
+  echo "--- claude stdout (if any) ---" >&2
+  echo "${CLAUDE_RESPONSE:-<empty>}" | head -c 2000 >&2
+  rm -f "$CLAUDE_STDERR"
+  kill $HEARTBEAT_PID 2>/dev/null || true
+  upsert_comment "_AI review failed: claude CLI exit $CLAUDE_EXIT. See workflow logs._"
+  exit 1
+fi
+rm -f "$CLAUDE_STDERR"
 echo "::endgroup::"
 
 kill $HEARTBEAT_PID 2>/dev/null || true
 
 MODEL_TEXT=$(printf '%s' "$CLAUDE_RESPONSE" | jq -r '.result // ""')
 if [ -z "$MODEL_TEXT" ]; then
-  echo "ERROR: claude returned no result" >&2
+  echo "ERROR: claude returned no result field" >&2
+  echo "--- full response ---" >&2
   echo "$CLAUDE_RESPONSE" | head -c 2000 >&2
   upsert_comment "_AI review failed: model returned no response. See workflow logs._"
   exit 1

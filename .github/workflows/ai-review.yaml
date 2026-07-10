@@ -6,6 +6,13 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+# Caller must grant the permissions the reusable workflow declares — GHA
+# won't let a callee widen its own scope. Explicit is safer than silent 403s.
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
 jobs:
   review:
     uses: fooelisa/ci-workflows/.github/workflows/ai-review.yaml@main

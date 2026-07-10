@@ -1,0 +1,13 @@
+# Local scratch
+*.credentials.json
+.env
+.env.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# macOS
+.DS_Store

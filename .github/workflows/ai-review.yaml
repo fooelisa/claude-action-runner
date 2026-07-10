@@ -1,0 +1,12 @@
+# Dogfood: this repo's own PRs get reviewed by the very image it publishes.
+# Uses :main rolling tag during initial iteration — bumps whenever main
+# builds a fresher image (so a PR that fixes a bug in review.sh is reviewed
+# by the pre-fix image; the fix ships and the NEXT PR benefits).
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review:
+    uses: fooelisa/ci-workflows/.github/workflows/ai-review.yaml@main
+    secrets: inherit

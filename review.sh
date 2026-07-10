@@ -1,34 +1,37 @@
 #!/usr/bin/env bash
 # review.sh — invoked by the reusable workflow inside a fresh container per PR.
-# Fetches the PR diff, sends it to Claude, upserts a summary comment on the PR.
+# Fetches the PR diff, sends it to the Anthropic Messages API, upserts a
+# summary comment on the PR.
 #
 # Forge-agnostic: dispatches on $GITHUB_API_URL (populated by both GitHub
 # Actions and Forgejo Actions from the server's ROOT_URL). Same script works
 # on both.
 #
 # Required env vars (set by the reusable workflow):
-#   GITHUB_TOKEN            forge PAT with write:issue
-#   ANTHROPIC_CREDENTIALS   full contents of ~/.claude/.credentials.json
-#   GITHUB_REPOSITORY       owner/repo
-#   GITHUB_API_URL          e.g. https://forgejo.motmot-carp.ts.net/api/v1
-#                                or https://api.github.com
-#   PR_NUMBER               PR / MR number
+#   GITHUB_TOKEN         forge PAT with write:issue
+#   ANTHROPIC_API_KEY    from console.anthropic.com
+#   GITHUB_REPOSITORY    owner/repo
+#   GITHUB_API_URL       e.g. https://forgejo.motmot-carp.ts.net/api/v1
+#                             or https://api.github.com
+#   PR_NUMBER            PR / MR number
+#
+# Optional:
+#   ANTHROPIC_MODEL      defaults to claude-sonnet-4-6
+#   MAX_TOKENS           defaults to 4096
 
 set -euo pipefail
 
 MAX_DIFF_CHARS=150000                             # ~40k tokens; drop-loud above this
 COMMENT_MARKER='<!-- claude-review:bot -->'       # upsert key
+ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-sonnet-4-6}"
+MAX_TOKENS="${MAX_TOKENS:-4096}"
 
-# ---------- 0. sanity + credential materialization ----------
+# ---------- 0. sanity ----------
 : "${GITHUB_TOKEN:?required}"
-: "${ANTHROPIC_CREDENTIALS:?required}"
+: "${ANTHROPIC_API_KEY:?required}"
 : "${GITHUB_REPOSITORY:?required}"
 : "${GITHUB_API_URL:?required}"
 : "${PR_NUMBER:?required}"
-
-mkdir -p "$HOME/.claude"
-printf '%s' "$ANTHROPIC_CREDENTIALS" > "$HOME/.claude/.credentials.json"
-chmod 600 "$HOME/.claude/.credentials.json"
 
 # Forge detection. GitHub's api base is api.github.com; anything else is
 # assumed Forgejo/Gitea-compatible. Only affects the diff-fetching endpoint;
@@ -38,8 +41,7 @@ case "$GITHUB_API_URL" in
   *)                       FORGE=forgejo ;;
 esac
 echo "::group::setup"
-echo "forge=$FORGE  repo=$GITHUB_REPOSITORY  pr=$PR_NUMBER"
-echo "claude CLI: $(claude --version 2>&1 || echo unavailable)"
+echo "forge=$FORGE  repo=$GITHUB_REPOSITORY  pr=$PR_NUMBER  model=$ANTHROPIC_MODEL"
 echo "::endgroup::"
 
 # ---------- 1. fetch PR metadata ----------
@@ -62,14 +64,12 @@ echo "head sha: $HEAD_SHA"
 # ---------- 2. fetch the diff ----------
 case "$FORGE" in
   github)
-    # GitHub returns the diff when Accept: application/vnd.github.v3.diff is set.
     RAW_DIFF=$(curl -sSf \
       -H "Authorization: token $GITHUB_TOKEN" \
       -H "Accept: application/vnd.github.v3.diff" \
       "${GITHUB_API_URL%/}/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")
     ;;
   forgejo)
-    # Forgejo/Gitea exposes .diff as a URL suffix.
     RAW_DIFF=$(curl -sSf \
       -H "Authorization: token $GITHUB_TOKEN" \
       "${GITHUB_API_URL%/}/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER.diff")
@@ -77,9 +77,6 @@ case "$FORGE" in
 esac
 
 # ---------- 3. filter noise files ----------
-# The awk drops per-file hunks whose diff header matches any pattern below.
-# It relies on `diff --git a/x b/x` as the hunk delimiter (standard unified
-# diff shape from both forges).
 FILTERED_DIFF=$(printf '%s\n' "$RAW_DIFF" | awk '
   BEGIN { keep=1 }
   /^diff --git / {
@@ -141,19 +138,14 @@ if [ "$DIFF_CHARS" -eq 0 ]; then
 fi
 
 # ---------- 5. build the prompt ----------
-# ⚠️ SYSTEM PROMPT: this block is the actual "product" of the reviewer.
-# See the SYSTEM_PROMPT.md doc alongside review.sh for the current wording.
-# Kept in a separate file so tuning the prompt doesn't require rebuilding
-# the image — the file is COPY'd in and read at runtime.
 SYSTEM_PROMPT_FILE="${SYSTEM_PROMPT_FILE:-/etc/claude-review/system-prompt.md}"
 if [ ! -f "$SYSTEM_PROMPT_FILE" ]; then
   echo "ERROR: system prompt file not found at $SYSTEM_PROMPT_FILE" >&2
   exit 1
 fi
 
-PROMPT=$(cat <<EOF
-$(cat "$SYSTEM_PROMPT_FILE")
-
+SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
+USER_MESSAGE=$(cat <<EOF
 <pr-title>${PR_TITLE}</pr-title>
 <pr-description>
 ${PR_BODY}
@@ -164,47 +156,64 @@ ${FILTERED_DIFF}
 EOF
 )
 
-# ---------- 6. invoke claude ----------
+# Build request body with jq so escaping is correct — the system prompt and
+# diff both contain quotes, newlines, and shell-hostile characters.
+REQUEST_BODY=$(jq -n \
+  --arg model "$ANTHROPIC_MODEL" \
+  --argjson max_tokens "$MAX_TOKENS" \
+  --arg system "$SYSTEM_PROMPT" \
+  --arg user "$USER_MESSAGE" \
+  '{
+    model: $model,
+    max_tokens: $max_tokens,
+    system: $system,
+    messages: [{role: "user", content: $user}]
+  }')
+
+# ---------- 6. call the Messages API ----------
 # Heartbeat every 30s so the workflow log doesn't look hung (Cloudflare lesson).
 (
   while sleep 30; do
-    echo "…still waiting on claude ($(date -u +%H:%M:%SZ))"
+    echo "…still waiting on anthropic ($(date -u +%H:%M:%SZ))"
   done
 ) &
 HEARTBEAT_PID=$!
 trap 'kill $HEARTBEAT_PID 2>/dev/null || true' EXIT
 
-echo "::group::claude call"
-# --output-format json wraps the model's textual response in a metadata envelope.
-# We ask the model to make its response itself be valid JSON, then double-parse.
-#
-# Capture stderr separately so failures surface a usable diagnostic in the
-# workflow log. Without this, `set -o pipefail` kills the script on a
-# non-zero claude exit and we never see WHY it failed.
-CLAUDE_STDERR=$(mktemp)
-if ! CLAUDE_RESPONSE=$(printf '%s' "$PROMPT" | claude -p --output-format json 2>"$CLAUDE_STDERR"); then
-  CLAUDE_EXIT=$?
-  echo "ERROR: claude CLI exit $CLAUDE_EXIT" >&2
-  echo "--- claude stderr ---" >&2
-  cat "$CLAUDE_STDERR" >&2
-  echo "--- claude stdout (if any) ---" >&2
-  echo "${CLAUDE_RESPONSE:-<empty>}" | head -c 2000 >&2
-  rm -f "$CLAUDE_STDERR"
-  kill $HEARTBEAT_PID 2>/dev/null || true
-  upsert_comment "_AI review failed: claude CLI exit $CLAUDE_EXIT. See workflow logs._"
-  exit 1
-fi
-rm -f "$CLAUDE_STDERR"
+echo "::group::anthropic call"
+
+API_RESPONSE=$(mktemp)
+HTTP_STATUS=$(printf '%s' "$REQUEST_BODY" | curl -sS -o "$API_RESPONSE" -w '%{http_code}' \
+  -X POST https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  --data-binary @-)
+
 echo "::endgroup::"
 
 kill $HEARTBEAT_PID 2>/dev/null || true
 
-MODEL_TEXT=$(printf '%s' "$CLAUDE_RESPONSE" | jq -r '.result // ""')
+if [ "$HTTP_STATUS" != "200" ]; then
+  echo "ERROR: Anthropic API returned HTTP $HTTP_STATUS" >&2
+  echo "--- response body ---" >&2
+  cat "$API_RESPONSE" >&2
+  rm -f "$API_RESPONSE"
+  upsert_comment "_AI review failed: Anthropic API HTTP $HTTP_STATUS. See workflow logs._"
+  exit 1
+fi
+
+MODEL_TEXT=$(jq -r '.content[0].text // ""' < "$API_RESPONSE")
+STOP_REASON=$(jq -r '.stop_reason // ""' < "$API_RESPONSE")
+INPUT_TOKENS=$(jq -r '.usage.input_tokens // 0' < "$API_RESPONSE")
+OUTPUT_TOKENS=$(jq -r '.usage.output_tokens // 0' < "$API_RESPONSE")
+rm -f "$API_RESPONSE"
+
+echo "usage: input=$INPUT_TOKENS output=$OUTPUT_TOKENS stop=$STOP_REASON"
+
 if [ -z "$MODEL_TEXT" ]; then
-  echo "ERROR: claude returned no result field" >&2
-  echo "--- full response ---" >&2
-  echo "$CLAUDE_RESPONSE" | head -c 2000 >&2
-  upsert_comment "_AI review failed: model returned no response. See workflow logs._"
+  echo "ERROR: Anthropic API returned no content" >&2
+  upsert_comment "_AI review failed: model returned empty content (stop_reason=$STOP_REASON). See workflow logs._"
   exit 1
 fi
 
@@ -214,7 +223,8 @@ JSON_PAYLOAD=$(printf '%s' "$MODEL_TEXT" \
   | jq -c '.' 2>/dev/null || true)
 
 if [ -z "$JSON_PAYLOAD" ]; then
-  echo "ERROR: claude output was not parseable JSON" >&2
+  echo "ERROR: model output was not parseable JSON" >&2
+  echo "--- raw model text (first 2000 chars) ---" >&2
   printf '%s' "$MODEL_TEXT" | head -c 2000 >&2
   upsert_comment "_AI review failed: model output did not parse as JSON. See workflow logs._"
   exit 1
@@ -222,7 +232,6 @@ fi
 
 # ---------- 7. render markdown ----------
 render_bucket() {
-  # $1 = severity key, $2 = emoji, $3 = display name
   local key="$1" emoji="$2" name="$3"
   local n
   n=$(printf '%s' "$JSON_PAYLOAD" | jq --arg k "$key" '.[$k] // [] | length')
@@ -246,7 +255,7 @@ $(render_bucket warnings    "🟡" "Warnings")
 $(render_bucket suggestions "🔵" "Suggestions")
 $(render_bucket nits        "⚪" "Nits")
 
-_Reviewed commit \`${HEAD_SHA:0:12}\`. Re-runs on every push._
+_Reviewed commit \`${HEAD_SHA:0:12}\` · model \`${ANTHROPIC_MODEL}\` · ${INPUT_TOKENS} in / ${OUTPUT_TOKENS} out tokens · re-runs on every push._
 EOF
 )
 

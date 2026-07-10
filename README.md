@@ -9,21 +9,19 @@ Companion project: [fooelisa/ci-workflows](https://github.com/fooelisa/ci-workfl
 1. Fetches PR metadata + unified diff from the forge API (auto-detects Forgejo vs GitHub via `$GITHUB_API_URL`).
 2. Filters noise files (lockfiles, generated, vendored, minified).
 3. Skips out if the filtered diff is empty or > 150K chars — posts a "diff too large" comment and exits cleanly.
-4. Pipes the prompt into `claude -p --output-format json` via stdin (Cloudflare's `ARG_MAX` lesson).
-5. Parses Claude's JSON output → renders Markdown.
+4. `POST`s to `https://api.anthropic.com/v1/messages` with the system prompt + user message (Cloudflare's `ARG_MAX` lesson doesn't apply since we're not passing anything on the command line).
+5. Parses the model's JSON output → renders Markdown.
 6. Upserts a single PR comment matched by the `<!-- claude-review:bot -->` HTML marker, so re-pushes update the same comment.
 
 ## Auth model
 
-Uses Claude Pro/Max OAuth (not a per-request Anthropic API key). The reusable workflow mounts the credentials as an env var; `review.sh` materializes them into `~/.claude/.credentials.json` at container start.
+Uses an Anthropic API key, not the Claude Code CLI and not Pro/Max OAuth.
 
-The tokens rotate roughly monthly. When a review starts failing with an auth error, refresh from the claude-workstation pod:
+We tried the OAuth path first — Claude Code 2.1+ requires a TTY-attached interactive session for the OAuth login chain to work, and headless containers don't have TTYs. The `--bare` mode of the CLI explicitly expects `ANTHROPIC_API_KEY` too, so we skip the CLI entirely and talk to `api.anthropic.com/v1/messages` directly with curl. Smaller image, no CLI-version drift.
 
-```
-kubectl exec -n claude deploy/claude -- cat /home/claude/.claude/.credentials.json
-```
+The reusable workflow injects the key as an env var; `review.sh` sends it in the `x-api-key` header. It never touches disk inside the container.
 
-Paste the output into the `ANTHROPIC_CREDENTIALS` org-level secret on each forge.
+Rotate via [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys) and re-set the `ANTHROPIC_API_KEY` org secret on each forge.
 
 ## Tuning the prompt
 

@@ -36,3 +36,5 @@ GHA builds on push to `main` and tags both `:main` and `:<commit-sha>` (immutabl
 Called with a Docker memory limit of `512m` on Forgejo (see the reusable workflow's `container.options`). Typical usage: ~250 MiB. Peak on large diffs: ~500 MiB. OOM at the cap fails the workflow cleanly — no cluster impact.
 
 <!-- next section starts here -->
+
+<!-- v3 anchor -->

@@ -2,7 +2,7 @@
 
 Ephemeral container that reviews a pull request with Claude when invoked by Forgejo Actions or GitHub Actions. Posts one structured summary comment on the PR with severity-bucketed findings (Critical / Warnings / Suggestions / Nits).
 
-Companion to [fooelisa/ci-workflows](https://github.com/fooelisa/ci-workflows), which is the reusable-workflow layer that consumer repos actually reference.
+Companion project: [fooelisa/ci-workflows](https://github.com/fooelisa/ci-workflows), which is the reusable-workflow layer that consumer repos actually reference.
 
 ## What it does
 

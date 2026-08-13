@@ -1,67 +1,368 @@
 #!/usr/bin/env bash
-# review.sh — invoked by the reusable workflow inside a fresh container per PR.
-# Fetches the PR diff, sends it to the Anthropic Messages API, upserts a
-# summary comment on the PR.
+# review.sh — invoked by the reusable workflow inside a fresh container per
+# PR event. v2 introduces a state machine over synchronize/comment events
+# so the LLM only runs on explicit review-requests, not every push.
 #
-# Forge-agnostic: dispatches on $GITHUB_API_URL (populated by both GitHub
-# Actions and Forgejo Actions from the server's ROOT_URL). Same script works
-# on both.
+# Modes:
+#   full          — call Claude, upsert comment with fresh state marker, post status
+#   synchronize   — never calls Claude; decides based on prior state marker:
+#                     - overridden or clean       → carry-forward success
+#                     - blocked + flagged file touched → auto-address (append footer, success)
+#                     - blocked + nothing touched → carry-forward failure
+#   override      — manual break-glass; append footer, mark state overridden, success
+#   noop          — event we don't handle (e.g., comment without slash cmd)
+#
+# Forge-agnostic: dispatches on $GITHUB_API_URL. Works on both GitHub Actions
+# and Forgejo Actions since Forgejo mirrors GHA's event names and API shapes.
 #
 # Required env vars (set by the reusable workflow):
-#   GITHUB_TOKEN         forge PAT with write:issue
+#   GITHUB_TOKEN         forge PAT with write:issue + write:statuses
 #   ANTHROPIC_API_KEY    from console.anthropic.com
 #   GITHUB_REPOSITORY    owner/repo
-#   GITHUB_API_URL       e.g. https://forgejo.motmot-carp.ts.net/api/v1
-#                             or https://api.github.com
-#   PR_NUMBER            PR / MR number
+#   GITHUB_API_URL       e.g. https://api.github.com  or  https://forgejo.motmot-carp.ts.net/api/v1
+#   GITHUB_EVENT_NAME    e.g. pull_request, issue_comment
+#   GITHUB_EVENT_PATH    JSON file with full event payload
 #
 # Optional:
 #   ANTHROPIC_MODEL      defaults to claude-sonnet-4-6
 #   MAX_TOKENS           defaults to 4096
+#   BOT_LOGIN            username of the bot account posting comments;
+#                        used to skip self-triggering. Defaults to
+#                        claude-reviewer (Forgejo) or the workflow actor
+#                        on GitHub.
 
 set -euo pipefail
 
-MAX_DIFF_CHARS=150000                             # ~40k tokens; drop-loud above this
-COMMENT_MARKER='<!-- claude-review:bot -->'       # upsert key
+# --------------------------- config ---------------------------
+MAX_DIFF_CHARS=150000
+COMMENT_MARKER='<!-- claude-review:bot -->'
+STATE_MARKER_PREFIX='<!-- claude-review:state '
+STATE_MARKER_SUFFIX=' -->'
+STATUS_CONTEXT='ai-review'
 ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-sonnet-4-6}"
 MAX_TOKENS="${MAX_TOKENS:-4096}"
+BOT_LOGIN_DEFAULT_FORGEJO='claude-reviewer'
 
-# ---------- 0. sanity ----------
+# --------------------------- env sanity ---------------------------
 : "${GITHUB_TOKEN:?required}"
 : "${ANTHROPIC_API_KEY:?required}"
 : "${GITHUB_REPOSITORY:?required}"
 : "${GITHUB_API_URL:?required}"
-: "${PR_NUMBER:?required}"
+: "${GITHUB_EVENT_NAME:?required}"
+: "${GITHUB_EVENT_PATH:?required}"
 
-# Forge detection. GitHub's api base is api.github.com; anything else is
-# assumed Forgejo/Gitea-compatible. Only affects the diff-fetching endpoint;
-# the comments endpoint is identical.
 case "$GITHUB_API_URL" in
   https://api.github.com*) FORGE=github ;;
   *)                       FORGE=forgejo ;;
 esac
-echo "::group::setup"
-echo "forge=$FORGE  repo=$GITHUB_REPOSITORY  pr=$PR_NUMBER  model=$ANTHROPIC_MODEL"
-echo "::endgroup::"
+BOT_LOGIN="${BOT_LOGIN:-$BOT_LOGIN_DEFAULT_FORGEJO}"
 
-# ---------- 1. fetch PR metadata ----------
+# --------------------------- helpers ---------------------------
+
+# api METHOD PATH [extra curl args...]
+# PATH begins with /repos/... — the base URL is prepended.
 api() {
-  # $1 = path (starts with /), $2..$N = extra curl args
+  local method="$1"; shift
   local path="$1"; shift
-  curl -sSf \
+  curl -sSf -X "$method" \
     -H "Authorization: token $GITHUB_TOKEN" \
     -H "Accept: application/json" \
     "${GITHUB_API_URL%/}/repos/$GITHUB_REPOSITORY$path" "$@"
 }
 
-pr_json=$(api "/pulls/$PR_NUMBER")
-PR_TITLE=$(printf '%s' "$pr_json" | jq -r '.title // ""')
-PR_BODY=$(printf '%s' "$pr_json" | jq -r '.body // ""')
-HEAD_SHA=$(printf '%s' "$pr_json" | jq -r '.head.sha')
-echo "pr title: $PR_TITLE"
-echo "head sha: $HEAD_SHA"
+# post_status SHA STATE DESCRIPTION
+post_status() {
+  local sha="$1" state="$2" desc="$3"
+  local payload
+  payload=$(jq -n --arg s "$state" --arg d "$desc" --arg c "$STATUS_CONTEXT" \
+    '{state: $s, context: $c, description: $d}')
+  printf '%s' "$payload" | curl -sSf -X POST \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data-binary @- \
+    "${GITHUB_API_URL%/}/repos/$GITHUB_REPOSITORY/statuses/$sha" > /dev/null
+  echo "posted status: sha=${sha:0:8} state=$state desc=\"$desc\""
+}
 
-# ---------- 2. fetch the diff ----------
+# fetch_existing_comment PR_NUM  — sets EXISTING_COMMENT_{ID,BODY} and STATE
+fetch_existing_comment() {
+  local pr_num="$1"
+  local resp
+  resp=$(api GET "/issues/$pr_num/comments")
+  EXISTING_COMMENT=$(printf '%s' "$resp" | jq --arg m "$COMMENT_MARKER" '[.[] | select(.body | contains($m))][0] // empty')
+  if [ -n "$EXISTING_COMMENT" ] && [ "$EXISTING_COMMENT" != "null" ]; then
+    EXISTING_COMMENT_ID=$(printf '%s' "$EXISTING_COMMENT" | jq -r '.id')
+    EXISTING_COMMENT_BODY=$(printf '%s' "$EXISTING_COMMENT" | jq -r '.body')
+    # Extract JSON between STATE_MARKER_PREFIX and STATE_MARKER_SUFFIX on one line.
+    STATE=$(printf '%s\n' "$EXISTING_COMMENT_BODY" \
+      | grep -oE "${STATE_MARKER_PREFIX}\{.*\}${STATE_MARKER_SUFFIX}" \
+      | head -1 \
+      | sed "s|^${STATE_MARKER_PREFIX}||; s|${STATE_MARKER_SUFFIX}\$||" || true)
+  else
+    EXISTING_COMMENT_ID=""
+    EXISTING_COMMENT_BODY=""
+    STATE=""
+  fi
+}
+
+# check_permission USER PR_AUTHOR — returns 0 if authorized to run slash cmds
+check_permission() {
+  local user="$1" pr_author="$2"
+  if [ "$user" = "$pr_author" ]; then return 0; fi
+  local perm
+  perm=$(api GET "/collaborators/$user/permission" 2>/dev/null | jq -r '.permission // "none"' || echo "none")
+  case "$perm" in
+    admin|maintain|write|push) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# get_changed_files BASE_SHA HEAD_SHA  — prints one filename per line
+get_changed_files() {
+  local base="$1" head="$2"
+  case "$FORGE" in
+    github)
+      api GET "/compare/$base...$head" | jq -r '.files[]?.filename // empty' | sort -u
+      ;;
+    forgejo)
+      # Forgejo's compare API returns .commits but not .files. Raw diff URL
+      # (web root, not /api/v1) returns unified diff we can parse.
+      local web_root diff_text
+      web_root="${GITHUB_API_URL%/api/v1}"
+      diff_text=$(curl -sSf -H "Authorization: token $GITHUB_TOKEN" \
+        "${web_root}/${GITHUB_REPOSITORY}/compare/${base}...${head}.diff" 2>/dev/null || echo "")
+      printf '%s\n' "$diff_text" | awk '/^diff --git / {
+        path=$NF; sub(/^b\//, "", path); print path
+      }' | sort -u
+      ;;
+  esac
+}
+
+# post_or_patch_comment PR_NUM BODY  — upserts by COMMENT_MARKER
+post_or_patch_comment() {
+  local pr_num="$1" body="$2"
+  local payload
+  payload=$(jq -n --arg b "$body" '{body: $b}')
+  # Refresh EXISTING_COMMENT_ID in case it wasn't fetched yet
+  if [ -z "${EXISTING_COMMENT_ID:-}" ]; then
+    fetch_existing_comment "$pr_num"
+  fi
+  if [ -n "$EXISTING_COMMENT_ID" ]; then
+    echo "patching comment id=$EXISTING_COMMENT_ID"
+    printf '%s' "$payload" | curl -sSf -X PATCH \
+      -H "Authorization: token $GITHUB_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data-binary @- \
+      "${GITHUB_API_URL%/}/repos/$GITHUB_REPOSITORY/issues/comments/$EXISTING_COMMENT_ID" > /dev/null
+  else
+    echo "posting new comment on PR $pr_num"
+    printf '%s' "$payload" | curl -sSf -X POST \
+      -H "Authorization: token $GITHUB_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data-binary @- \
+      "${GITHUB_API_URL%/}/repos/$GITHUB_REPOSITORY/issues/$pr_num/comments" > /dev/null
+  fi
+}
+
+# render_state_line NEW_STATE_JSON  — outputs the HTML state marker line
+render_state_line() {
+  local state_json="$1"
+  printf '%s%s%s' "$STATE_MARKER_PREFIX" "$state_json" "$STATE_MARKER_SUFFIX"
+}
+
+# replace_state_marker BODY NEW_STATE_LINE  — swaps the state line in a body,
+# or inserts it right after the COMMENT_MARKER line if missing.
+replace_state_marker() {
+  local body="$1" new_state_line="$2"
+  # Escape for awk: pass via env, not command line.
+  export NEW_STATE_LINE="$new_state_line"
+  export COMMENT_MARKER_ENV="$COMMENT_MARKER"
+  export STATE_MARKER_PREFIX_ENV="$STATE_MARKER_PREFIX"
+  printf '%s' "$body" | awk '
+    BEGIN {
+      cm = ENVIRON["COMMENT_MARKER_ENV"]
+      sp = ENVIRON["STATE_MARKER_PREFIX_ENV"]
+      ns = ENVIRON["NEW_STATE_LINE"]
+      replaced = 0
+      cm_seen = 0
+    }
+    {
+      if (index($0, sp) == 1) {
+        # Line begins with the state marker prefix → replace
+        print ns
+        replaced = 1
+        next
+      }
+      print
+      if (index($0, cm) == 1 && !cm_seen) {
+        cm_seen = 1
+      }
+    }
+    END {
+      if (!replaced && cm_seen) {
+        # No existing state line, but we saw the comment marker → append at end
+        # (Should be rare — every v2 comment writes both lines together)
+      }
+    }
+  '
+  unset NEW_STATE_LINE COMMENT_MARKER_ENV STATE_MARKER_PREFIX_ENV
+}
+
+# today_utc  — YYYY-MM-DD in UTC
+today_utc() { date -u +%Y-%m-%d; }
+
+# --------------------------- event dispatch ---------------------------
+EVENT_PAYLOAD=$(cat "$GITHUB_EVENT_PATH")
+EVENT_ACTION=$(printf '%s' "$EVENT_PAYLOAD" | jq -r '.action // ""')
+PR_NUMBER=""
+PR_AUTHOR=""
+COMMENTER=""
+COMMENT_BODY=""
+MODE="noop"
+
+echo "::group::setup"
+echo "forge=$FORGE  event=$GITHUB_EVENT_NAME  action=$EVENT_ACTION  repo=$GITHUB_REPOSITORY"
+
+case "$GITHUB_EVENT_NAME" in
+  pull_request)
+    PR_NUMBER=$(printf '%s' "$EVENT_PAYLOAD" | jq -r '.pull_request.number // ""')
+    PR_AUTHOR=$(printf '%s' "$EVENT_PAYLOAD" | jq -r '.pull_request.user.login // ""')
+    case "$EVENT_ACTION" in
+      opened|reopened) MODE=full ;;
+      synchronize)     MODE=synchronize ;;
+      *) echo "ignoring pull_request action: $EVENT_ACTION"; echo "::endgroup::"; exit 0 ;;
+    esac
+    ;;
+
+  issue_comment)
+    IS_PR=$(printf '%s' "$EVENT_PAYLOAD" | jq -r '.issue.pull_request.url // ""')
+    if [ -z "$IS_PR" ]; then
+      echo "ignoring: comment on issue (not PR)"; echo "::endgroup::"; exit 0
+    fi
+    if [ "$EVENT_ACTION" != "created" ]; then
+      echo "ignoring issue_comment action: $EVENT_ACTION"; echo "::endgroup::"; exit 0
+    fi
+    PR_NUMBER=$(printf '%s' "$EVENT_PAYLOAD" | jq -r '.issue.number')
+    PR_AUTHOR=$(printf '%s' "$EVENT_PAYLOAD" | jq -r '.issue.user.login')
+    COMMENTER=$(printf '%s' "$EVENT_PAYLOAD" | jq -r '.comment.user.login')
+    COMMENT_BODY=$(printf '%s' "$EVENT_PAYLOAD" | jq -r '.comment.body // ""')
+
+    # Skip our own comments (defense against feedback loop)
+    if [ "$COMMENTER" = "$BOT_LOGIN" ] || printf '%s' "$COMMENT_BODY" | grep -qF "$COMMENT_MARKER"; then
+      echo "ignoring: our own comment"; echo "::endgroup::"; exit 0
+    fi
+
+    if printf '%s' "$COMMENT_BODY" | grep -qE '^[[:space:]]*/review\b'; then
+      MODE=full
+    elif printf '%s' "$COMMENT_BODY" | grep -qE '^[[:space:]]*/override-ai-review\b'; then
+      MODE=override
+    else
+      echo "ignoring: no slash command"; echo "::endgroup::"; exit 0
+    fi
+
+    if ! check_permission "$COMMENTER" "$PR_AUTHOR"; then
+      echo "ignoring: $COMMENTER not authorized (must be PR author or write-collab)"
+      echo "::endgroup::"; exit 0
+    fi
+    ;;
+
+  *)
+    echo "ignoring event: $GITHUB_EVENT_NAME"; echo "::endgroup::"; exit 0
+    ;;
+esac
+
+echo "mode=$MODE  pr=$PR_NUMBER  author=$PR_AUTHOR  commenter=${COMMENTER:-n/a}"
+echo "::endgroup::"
+
+# --------------------------- fetch PR metadata ---------------------------
+PR_JSON=$(api GET "/pulls/$PR_NUMBER")
+CURRENT_HEAD_SHA=$(printf '%s' "$PR_JSON" | jq -r '.head.sha')
+PR_TITLE=$(printf '%s' "$PR_JSON" | jq -r '.title // ""')
+PR_BODY=$(printf '%s' "$PR_JSON" | jq -r '.body // ""')
+
+fetch_existing_comment "$PR_NUMBER"
+
+# --------------------------- mode: synchronize ---------------------------
+if [ "$MODE" = "synchronize" ]; then
+  if [ -z "$STATE" ]; then
+    echo "synchronize: no prior state marker → falling through to full review"
+    MODE=full
+  else
+    OVERRIDDEN=$(printf '%s' "$STATE" | jq -r '.overridden // false')
+    CRITICAL_COUNT=$(printf '%s' "$STATE" | jq -r '.critical_count // 0')
+    REVIEWED_SHA=$(printf '%s' "$STATE" | jq -r '.reviewed_sha // ""')
+
+    if [ "$OVERRIDDEN" = "true" ]; then
+      post_status "$CURRENT_HEAD_SHA" success "Overridden — carried forward"
+      exit 0
+    fi
+    if [ "$CRITICAL_COUNT" = "0" ]; then
+      post_status "$CURRENT_HEAD_SHA" success "Review OK — carried forward"
+      exit 0
+    fi
+    # Blocked → check auto-address
+    CRITICAL_FILES_JSON=$(printf '%s' "$STATE" | jq -c '.critical_files // []')
+    CRITICAL_FILES=$(printf '%s' "$CRITICAL_FILES_JSON" | jq -r '.[]?' | sort -u)
+    if [ -z "$CRITICAL_FILES" ] || [ -z "$REVIEWED_SHA" ]; then
+      echo "synchronize: state marker missing critical_files or reviewed_sha → carry-forward failure"
+      post_status "$CURRENT_HEAD_SHA" failure "${CRITICAL_COUNT} Critical finding(s) — resolve or /override-ai-review"
+      exit 0
+    fi
+
+    echo "synchronize: reviewed_sha=$REVIEWED_SHA current=$CURRENT_HEAD_SHA"
+    CHANGED_FILES=$(get_changed_files "$REVIEWED_SHA" "$CURRENT_HEAD_SHA" || true)
+    echo "changed files since review:"
+    printf '  %s\n' $CHANGED_FILES 2>/dev/null || true
+    echo "critical files from last review:"
+    printf '  %s\n' $CRITICAL_FILES 2>/dev/null || true
+
+    TOUCHED=$(comm -12 <(printf '%s\n' "$CRITICAL_FILES") <(printf '%s\n' "$CHANGED_FILES") | grep -v '^$' || true)
+
+    if [ -n "$TOUCHED" ]; then
+      echo "auto-address: touched $(echo "$TOUCHED" | tr '\n' ',' | sed 's/,$//')"
+      # Update state marker → overridden by auto-address
+      NEW_STATE_JSON=$(printf '%s' "$STATE" | jq -c \
+        --arg by "auto-addressed by push" \
+        --arg sha "$CURRENT_HEAD_SHA" \
+        '.overridden = true | .overridden_by = $by | .overridden_sha = $sha')
+      NEW_STATE_LINE=$(render_state_line "$NEW_STATE_JSON")
+      TOUCHED_CSV=$(echo "$TOUCHED" | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')
+      NEW_BODY=$(replace_state_marker "$EXISTING_COMMENT_BODY" "$NEW_STATE_LINE")
+      NEW_BODY="${NEW_BODY}"$'\n\n'"_✅ **Auto-addressed** by commit \`${CURRENT_HEAD_SHA:0:8}\` on $(today_utc) — touched: \`${TOUCHED_CSV}\`. Comment \`/review\` for a fresh look._"
+      post_or_patch_comment "$PR_NUMBER" "$NEW_BODY"
+      post_status "$CURRENT_HEAD_SHA" success "Auto-addressed by push"
+      exit 0
+    else
+      echo "no flagged files touched → carry-forward failure"
+      post_status "$CURRENT_HEAD_SHA" failure "${CRITICAL_COUNT} Critical finding(s) — resolve or /override-ai-review"
+      exit 0
+    fi
+  fi
+fi
+
+# --------------------------- mode: override ---------------------------
+if [ "$MODE" = "override" ]; then
+  if [ -z "$STATE" ]; then
+    echo "override requested but no prior state → running full review instead"
+    MODE=full
+  else
+    NEW_STATE_JSON=$(printf '%s' "$STATE" | jq -c \
+      --arg by "@$COMMENTER" \
+      --arg sha "$CURRENT_HEAD_SHA" \
+      '.overridden = true | .overridden_by = $by | .overridden_sha = $sha')
+    NEW_STATE_LINE=$(render_state_line "$NEW_STATE_JSON")
+    NEW_BODY=$(replace_state_marker "$EXISTING_COMMENT_BODY" "$NEW_STATE_LINE")
+    NEW_BODY="${NEW_BODY}"$'\n\n'"_✅ **Overridden by @${COMMENTER}** on $(today_utc) at commit \`${CURRENT_HEAD_SHA:0:8}\`._"
+    post_or_patch_comment "$PR_NUMBER" "$NEW_BODY"
+    post_status "$CURRENT_HEAD_SHA" success "Overridden by @${COMMENTER}"
+    exit 0
+  fi
+fi
+
+# --------------------------- mode: full ---------------------------
+# The rest is the v1 review flow, extended with state marker + status posting.
+
+# Fetch full diff
 case "$FORGE" in
   github)
     RAW_DIFF=$(curl -sSf \
@@ -76,7 +377,7 @@ case "$FORGE" in
     ;;
 esac
 
-# ---------- 3. filter noise files ----------
+# Filter noise
 FILTERED_DIFF=$(printf '%s\n' "$RAW_DIFF" | awk '
   BEGIN { keep=1 }
   /^diff --git / {
@@ -91,59 +392,38 @@ FILTERED_DIFF=$(printf '%s\n' "$RAW_DIFF" | awk '
   }
   keep { print }
 ')
-
 DIFF_CHARS=${#FILTERED_DIFF}
 echo "diff chars after filter: $DIFF_CHARS (cap $MAX_DIFF_CHARS)"
 
-# ---------- 4. upsert helper (defined early — used by too-large exit path too) ----------
-upsert_comment() {
-  local body="$1"
-  local marker_body
-  marker_body=$(printf '%s\n\n%s' "$COMMENT_MARKER" "$body")
-
-  local existing_id
-  existing_id=$(api "/issues/$PR_NUMBER/comments" \
-    | jq --arg m "$COMMENT_MARKER" '[.[] | select(.body | contains($m))][0].id // empty')
-
-  local payload
-  payload=$(jq -n --arg b "$marker_body" '{body: $b}')
-
-  if [ -n "$existing_id" ]; then
-    echo "patching existing comment $existing_id"
-    curl -sSf -X PATCH \
-      -H "Authorization: token $GITHUB_TOKEN" \
-      -H "Content-Type: application/json" \
-      -d "$payload" \
-      "${GITHUB_API_URL%/}/repos/$GITHUB_REPOSITORY/issues/comments/$existing_id" > /dev/null
-  else
-    echo "posting new comment"
-    curl -sSf -X POST \
-      -H "Authorization: token $GITHUB_TOKEN" \
-      -H "Content-Type: application/json" \
-      -d "$payload" \
-      "${GITHUB_API_URL%/}/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" > /dev/null
-  fi
+# skip_review REASON DESC — used for empty/too-large diffs
+skip_review() {
+  local reason="$1" desc="$2"
+  local body="${COMMENT_MARKER}"$'\n'
+  local state_line
+  state_line=$(render_state_line "$(jq -cn --arg sha "$CURRENT_HEAD_SHA" \
+    '{critical_count:0,critical_files:[],warnings:0,suggestions:0,nits:0,overridden:false,reviewed_sha:$sha}')")
+  body="${body}${state_line}"$'\n\n'"### 🤖 Claude Review"$'\n\n'"$reason"$'\n\n'"_Skipped commit \`${CURRENT_HEAD_SHA:0:8}\`._"
+  post_or_patch_comment "$PR_NUMBER" "$body"
+  post_status "$CURRENT_HEAD_SHA" success "$desc"
+  exit 0
 }
 
 if [ "$DIFF_CHARS" -gt "$MAX_DIFF_CHARS" ]; then
-  upsert_comment "_Diff too large for AI review (${DIFF_CHARS} chars > ${MAX_DIFF_CHARS} cap after filtering)._"
-  echo "diff too large — posted skip comment, exiting 0"
-  exit 0
+  skip_review "_Diff too large for AI review (${DIFF_CHARS} chars > ${MAX_DIFF_CHARS} cap after filtering)._" \
+              "Skipped — diff too large"
 fi
-
 if [ "$DIFF_CHARS" -eq 0 ]; then
-  upsert_comment "_No reviewable changes after filtering (lockfiles / generated / vendored files skipped)._"
-  echo "empty diff after filter — posted skip comment, exiting 0"
-  exit 0
+  skip_review "_No reviewable changes after filtering (lockfiles / generated / vendored files skipped)._" \
+              "Skipped — empty diff"
 fi
 
-# ---------- 5. build the prompt ----------
+# Build prompt
 SYSTEM_PROMPT_FILE="${SYSTEM_PROMPT_FILE:-/etc/claude-review/system-prompt.md}"
 if [ ! -f "$SYSTEM_PROMPT_FILE" ]; then
+  post_status "$CURRENT_HEAD_SHA" error "System prompt file missing — see logs"
   echo "ERROR: system prompt file not found at $SYSTEM_PROMPT_FILE" >&2
   exit 1
 fi
-
 SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
 USER_MESSAGE=$(cat <<EOF
 <pr-title>${PR_TITLE}</pr-title>
@@ -156,8 +436,6 @@ ${FILTERED_DIFF}
 EOF
 )
 
-# Build request body with jq so escaping is correct — the system prompt and
-# diff both contain quotes, newlines, and shell-hostile characters.
 REQUEST_BODY=$(jq -n \
   --arg model "$ANTHROPIC_MODEL" \
   --argjson max_tokens "$MAX_TOKENS" \
@@ -170,18 +448,12 @@ REQUEST_BODY=$(jq -n \
     messages: [{role: "user", content: $user}]
   }')
 
-# ---------- 6. call the Messages API ----------
-# Heartbeat every 30s so the workflow log doesn't look hung (Cloudflare lesson).
-(
-  while sleep 30; do
-    echo "…still waiting on anthropic ($(date -u +%H:%M:%SZ))"
-  done
-) &
+# Heartbeat during Anthropic call
+( while sleep 30; do echo "…still waiting on anthropic ($(date -u +%H:%M:%SZ))"; done ) &
 HEARTBEAT_PID=$!
 trap 'kill $HEARTBEAT_PID 2>/dev/null || true' EXIT
 
 echo "::group::anthropic call"
-
 API_RESPONSE=$(mktemp)
 HTTP_STATUS=$(printf '%s' "$REQUEST_BODY" | curl -sS -o "$API_RESPONSE" -w '%{http_code}' \
   -X POST https://api.anthropic.com/v1/messages \
@@ -189,48 +461,60 @@ HTTP_STATUS=$(printf '%s' "$REQUEST_BODY" | curl -sS -o "$API_RESPONSE" -w '%{ht
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
   --data-binary @-)
-
 echo "::endgroup::"
-
 kill $HEARTBEAT_PID 2>/dev/null || true
 
 if [ "$HTTP_STATUS" != "200" ]; then
   echo "ERROR: Anthropic API returned HTTP $HTTP_STATUS" >&2
   echo "--- response body ---" >&2
   cat "$API_RESPONSE" >&2
+  post_status "$CURRENT_HEAD_SHA" error "Anthropic API HTTP $HTTP_STATUS — see logs"
   rm -f "$API_RESPONSE"
-  upsert_comment "_AI review failed: Anthropic API HTTP $HTTP_STATUS. See workflow logs._"
   exit 1
 fi
 
 MODEL_TEXT=$(jq -r '.content[0].text // ""' < "$API_RESPONSE")
-STOP_REASON=$(jq -r '.stop_reason // ""' < "$API_RESPONSE")
 INPUT_TOKENS=$(jq -r '.usage.input_tokens // 0' < "$API_RESPONSE")
 OUTPUT_TOKENS=$(jq -r '.usage.output_tokens // 0' < "$API_RESPONSE")
 rm -f "$API_RESPONSE"
-
-echo "usage: input=$INPUT_TOKENS output=$OUTPUT_TOKENS stop=$STOP_REASON"
+echo "usage: input=$INPUT_TOKENS output=$OUTPUT_TOKENS"
 
 if [ -z "$MODEL_TEXT" ]; then
-  echo "ERROR: Anthropic API returned no content" >&2
-  upsert_comment "_AI review failed: model returned empty content (stop_reason=$STOP_REASON). See workflow logs._"
+  post_status "$CURRENT_HEAD_SHA" error "Empty model response — see logs"
+  echo "ERROR: Anthropic returned empty content" >&2
   exit 1
 fi
 
-# Strip common wrapping: ```json ... ``` fences, leading/trailing whitespace.
+# Strip common fences and parse
 JSON_PAYLOAD=$(printf '%s' "$MODEL_TEXT" \
   | sed -e 's/^```json//' -e 's/^```//' -e 's/```$//' \
   | jq -c '.' 2>/dev/null || true)
 
 if [ -z "$JSON_PAYLOAD" ]; then
-  echo "ERROR: model output was not parseable JSON" >&2
-  echo "--- raw model text (first 2000 chars) ---" >&2
+  post_status "$CURRENT_HEAD_SHA" error "Model output not JSON — see logs"
+  echo "ERROR: model output was not parseable JSON:" >&2
   printf '%s' "$MODEL_TEXT" | head -c 2000 >&2
-  upsert_comment "_AI review failed: model output did not parse as JSON. See workflow logs._"
   exit 1
 fi
 
-# ---------- 7. render markdown ----------
+# Extract counts + critical_files for the state marker
+CRITICAL_COUNT=$(printf '%s' "$JSON_PAYLOAD" | jq -r '.critical // [] | length')
+WARNINGS_COUNT=$(printf '%s' "$JSON_PAYLOAD" | jq -r '.warnings // [] | length')
+SUGGESTIONS_COUNT=$(printf '%s' "$JSON_PAYLOAD" | jq -r '.suggestions // [] | length')
+NITS_COUNT=$(printf '%s' "$JSON_PAYLOAD" | jq -r '.nits // [] | length')
+CRITICAL_FILES_JSON=$(printf '%s' "$JSON_PAYLOAD" | jq -c '[.critical[]?.file] | unique')
+
+NEW_STATE_JSON=$(jq -cn \
+  --argjson cc "$CRITICAL_COUNT" \
+  --argjson cf "$CRITICAL_FILES_JSON" \
+  --argjson w  "$WARNINGS_COUNT" \
+  --argjson s  "$SUGGESTIONS_COUNT" \
+  --argjson n  "$NITS_COUNT" \
+  --arg sha "$CURRENT_HEAD_SHA" \
+  '{critical_count:$cc, critical_files:$cf, warnings:$w, suggestions:$s, nits:$n, overridden:false, reviewed_sha:$sha}')
+NEW_STATE_LINE=$(render_state_line "$NEW_STATE_JSON")
+
+# Render markdown
 render_bucket() {
   local key="$1" emoji="$2" name="$3"
   local n
@@ -246,7 +530,14 @@ render_bucket() {
 
 SUMMARY=$(printf '%s' "$JSON_PAYLOAD" | jq -r '.summary // "(no summary)"')
 
-BODY=$(cat <<EOF
+BLOCK_FOOTER=""
+if [ "$CRITICAL_COUNT" -gt 0 ]; then
+  BLOCK_FOOTER=$'\n\n'"_⛔ **Merge blocked**: ${CRITICAL_COUNT} Critical finding(s). Resolve them, or override with \`/override-ai-review\`._"
+fi
+
+NEW_BODY=$(cat <<EOF
+${COMMENT_MARKER}
+${NEW_STATE_LINE}
 ### 🤖 Claude Review
 
 **Summary**: ${SUMMARY}
@@ -255,9 +546,17 @@ $(render_bucket warnings    "🟡" "Warnings")
 $(render_bucket suggestions "🔵" "Suggestions")
 $(render_bucket nits        "⚪" "Nits")
 
-_Reviewed commit \`${HEAD_SHA:0:12}\` · model \`${ANTHROPIC_MODEL}\` · ${INPUT_TOKENS} in / ${OUTPUT_TOKENS} out tokens · re-runs on every push._
+_Reviewed commit \`${CURRENT_HEAD_SHA:0:8}\` · model \`${ANTHROPIC_MODEL}\` · ${INPUT_TOKENS} in / ${OUTPUT_TOKENS} out tokens._
+_Re-review: comment \`/review\` · Override block: \`/override-ai-review\`_${BLOCK_FOOTER}
 EOF
 )
 
-upsert_comment "$BODY"
-echo "review posted"
+post_or_patch_comment "$PR_NUMBER" "$NEW_BODY"
+
+if [ "$CRITICAL_COUNT" -gt 0 ]; then
+  post_status "$CURRENT_HEAD_SHA" failure "${CRITICAL_COUNT} Critical finding(s) — resolve or /override-ai-review"
+else
+  post_status "$CURRENT_HEAD_SHA" success "Review OK — 0 Critical, ${WARNINGS_COUNT} Warning(s)"
+fi
+
+echo "review posted (critical=$CRITICAL_COUNT warnings=$WARNINGS_COUNT suggestions=$SUGGESTIONS_COUNT nits=$NITS_COUNT)"

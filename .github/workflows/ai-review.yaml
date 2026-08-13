@@ -1,17 +1,21 @@
-# Dogfood: this repo's own PRs get reviewed by the very image it publishes.
-# Uses :main rolling tag during initial iteration — bumps whenever main
-# builds a fresher image (so a PR that fixes a bug in review.sh is reviewed
-# by the pre-fix image; the fix ships and the NEXT PR benefits).
+# AI PR reviewer. See fooelisa/ci-workflows for the reusable workflow +
+# fooelisa/claude-action-runner for the image + prompt. Runs on
+# github-hosted runners, zero cluster impact.
+#
+# Requires the ANTHROPIC_API_KEY secret at repo level (fooelisa is a
+# personal GitHub account, no org-level secrets available).
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
 
-# Caller must grant the permissions the reusable workflow declares — GHA
-# won't let a callee widen its own scope. Explicit is safer than silent 403s.
+# Required: caller must grant what the reusable workflow needs.
 permissions:
   contents: read
   pull-requests: write
   issues: write
+  statuses: write        # for the ai-review commit status (gates merge)
 
 jobs:
   review:

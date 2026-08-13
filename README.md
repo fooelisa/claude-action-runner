@@ -48,3 +48,5 @@ Called with a Docker memory limit of `512m` on Forgejo (see the reusable workflo
 - Full review (opened / `/review`): ~$0.005–0.02 depending on diff size (Sonnet 4.6 pricing)
 - **Any synchronize event: $0** — just API calls to fetch state and post status
 - Manual override / auto-address: $0
+
+<!-- v2 state-machine verification anchor (2026-08-13) -->

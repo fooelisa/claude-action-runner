@@ -50,3 +50,5 @@ Called with a Docker memory limit of `512m` on Forgejo (see the reusable workflo
 - Manual override / auto-address: $0
 
 <!-- v2 state-machine verification anchor (2026-08-13) -->
+
+<!-- carry-forward test push (2026-08-13) -->

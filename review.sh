@@ -85,11 +85,15 @@ post_status() {
 }
 
 # fetch_existing_comment PR_NUM  — sets EXISTING_COMMENT_{ID,BODY} and STATE
+# Picks the LATEST bot comment (highest created_at). Older bot comments
+# are historical — a fresh `/review` posts a NEW comment rather than
+# overwriting the previous one, so history accumulates over time. Only
+# override + auto-address footers patch the latest comment in place.
 fetch_existing_comment() {
   local pr_num="$1"
   local resp
   resp=$(api GET "/issues/$pr_num/comments")
-  EXISTING_COMMENT=$(printf '%s' "$resp" | jq --arg m "$COMMENT_MARKER" '[.[] | select(.body | contains($m))][0] // empty')
+  EXISTING_COMMENT=$(printf '%s' "$resp" | jq --arg m "$COMMENT_MARKER" '[.[] | select(.body | contains($m))] | sort_by(.created_at) | last // empty')
   if [ -n "$EXISTING_COMMENT" ] && [ "$EXISTING_COMMENT" != "null" ]; then
     EXISTING_COMMENT_ID=$(printf '%s' "$EXISTING_COMMENT" | jq -r '.id')
     EXISTING_COMMENT_BODY=$(printf '%s' "$EXISTING_COMMENT" | jq -r '.body')
@@ -138,30 +142,45 @@ get_changed_files() {
   esac
 }
 
-# post_or_patch_comment PR_NUM BODY  — upserts by COMMENT_MARKER
-post_or_patch_comment() {
+# post_new_comment PR_NUM BODY  — always POSTs a fresh comment
+# Used for initial review (opened/reopened), `/review` re-review, and
+# skip-review outcomes. Prior bot comments stay untouched as history.
+post_new_comment() {
   local pr_num="$1" body="$2"
   local payload
   payload=$(jq -n --arg b "$body" '{body: $b}')
-  # Refresh EXISTING_COMMENT_ID in case it wasn't fetched yet
+  echo "posting new comment on PR $pr_num"
+  printf '%s' "$payload" | curl -sSf -X POST \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data-binary @- \
+    "${GITHUB_API_URL%/}/repos/$GITHUB_REPOSITORY/issues/$pr_num/comments" > /dev/null
+}
+
+# patch_latest_comment PR_NUM BODY  — PATCHes the latest bot comment in place
+# Used for auto-address + override footer appends. Requires that
+# fetch_existing_comment has run and EXISTING_COMMENT_ID is set.
+patch_latest_comment() {
+  local pr_num="$1" body="$2"
   if [ -z "${EXISTING_COMMENT_ID:-}" ]; then
     fetch_existing_comment "$pr_num"
   fi
-  if [ -n "$EXISTING_COMMENT_ID" ]; then
-    echo "patching comment id=$EXISTING_COMMENT_ID"
-    printf '%s' "$payload" | curl -sSf -X PATCH \
-      -H "Authorization: token $GITHUB_TOKEN" \
-      -H "Content-Type: application/json" \
-      --data-binary @- \
-      "${GITHUB_API_URL%/}/repos/$GITHUB_REPOSITORY/issues/comments/$EXISTING_COMMENT_ID" > /dev/null
-  else
-    echo "posting new comment on PR $pr_num"
-    printf '%s' "$payload" | curl -sSf -X POST \
-      -H "Authorization: token $GITHUB_TOKEN" \
-      -H "Content-Type: application/json" \
-      --data-binary @- \
-      "${GITHUB_API_URL%/}/repos/$GITHUB_REPOSITORY/issues/$pr_num/comments" > /dev/null
+  if [ -z "${EXISTING_COMMENT_ID:-}" ]; then
+    # Nothing to patch — this shouldn't happen in override/auto-address
+    # flow since both branches guarded on STATE being present. Fall back
+    # to POST rather than lose the comment.
+    echo "warning: patch_latest_comment with no existing comment — posting instead"
+    post_new_comment "$pr_num" "$body"
+    return
   fi
+  local payload
+  payload=$(jq -n --arg b "$body" '{body: $b}')
+  echo "patching comment id=$EXISTING_COMMENT_ID"
+  printf '%s' "$payload" | curl -sSf -X PATCH \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data-binary @- \
+    "${GITHUB_API_URL%/}/repos/$GITHUB_REPOSITORY/issues/comments/$EXISTING_COMMENT_ID" > /dev/null
 }
 
 # render_state_line NEW_STATE_JSON  — outputs the HTML state marker line
@@ -329,7 +348,7 @@ if [ "$MODE" = "synchronize" ]; then
       TOUCHED_CSV=$(echo "$TOUCHED" | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')
       NEW_BODY=$(replace_state_marker "$EXISTING_COMMENT_BODY" "$NEW_STATE_LINE")
       NEW_BODY="${NEW_BODY}"$'\n\n'"_✅ **Auto-addressed** by commit \`${CURRENT_HEAD_SHA:0:8}\` on $(today_utc) — touched: \`${TOUCHED_CSV}\`. Comment \`/review\` for a fresh look._"
-      post_or_patch_comment "$PR_NUMBER" "$NEW_BODY"
+      patch_latest_comment "$PR_NUMBER" "$NEW_BODY"
       post_status "$CURRENT_HEAD_SHA" success "Auto-addressed by push"
       exit 0
     else
@@ -353,7 +372,7 @@ if [ "$MODE" = "override" ]; then
     NEW_STATE_LINE=$(render_state_line "$NEW_STATE_JSON")
     NEW_BODY=$(replace_state_marker "$EXISTING_COMMENT_BODY" "$NEW_STATE_LINE")
     NEW_BODY="${NEW_BODY}"$'\n\n'"_✅ **Overridden by @${COMMENTER}** on $(today_utc) at commit \`${CURRENT_HEAD_SHA:0:8}\`._"
-    post_or_patch_comment "$PR_NUMBER" "$NEW_BODY"
+    patch_latest_comment "$PR_NUMBER" "$NEW_BODY"
     post_status "$CURRENT_HEAD_SHA" success "Overridden by @${COMMENTER}"
     exit 0
   fi
@@ -403,7 +422,7 @@ skip_review() {
   state_line=$(render_state_line "$(jq -cn --arg sha "$CURRENT_HEAD_SHA" \
     '{critical_count:0,critical_files:[],warnings:0,suggestions:0,nits:0,overridden:false,reviewed_sha:$sha}')")
   body="${body}${state_line}"$'\n\n'"### 🤖 Claude Review"$'\n\n'"$reason"$'\n\n'"_Skipped commit \`${CURRENT_HEAD_SHA:0:8}\`._"
-  post_or_patch_comment "$PR_NUMBER" "$body"
+  post_new_comment "$PR_NUMBER" "$body"
   post_status "$CURRENT_HEAD_SHA" success "$desc"
   exit 0
 }
@@ -551,7 +570,7 @@ _Re-review: comment \`/review\` · Override block: \`/override-ai-review\`_${BLO
 EOF
 )
 
-post_or_patch_comment "$PR_NUMBER" "$NEW_BODY"
+post_new_comment "$PR_NUMBER" "$NEW_BODY"
 
 if [ "$CRITICAL_COUNT" -gt 0 ]; then
   post_status "$CURRENT_HEAD_SHA" failure "${CRITICAL_COUNT} Critical finding(s) — resolve or /override-ai-review"

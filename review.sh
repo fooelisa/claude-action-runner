@@ -365,8 +365,24 @@ fi
 # --------------------------- mode: override ---------------------------
 if [ "$MODE" = "override" ]; then
   if [ -z "$STATE" ]; then
-    echo "override requested but no prior state → running full review instead"
-    MODE=full
+    # No prior bot comment to patch. Falling back to a full review here made the
+    # break-glass useless in the one case it most needs to work: when the
+    # reviewer itself is broken, no review ever posts a comment, so there is no
+    # state to override, so the override runs a review, which fails the same way.
+    # That deadlocked fooelisa/claude-action-runner#5 - the PR fixing the
+    # reviewer could not be merged past the reviewer it was fixing.
+    # An explicit override is a human decision to stop blocking; honour it by
+    # opening the state rather than re-running the thing being overridden.
+    echo "override requested with no prior state → recording override without a review"
+    NEW_STATE_JSON=$(jq -nc \
+      --arg by "@$COMMENTER" \
+      --arg sha "$CURRENT_HEAD_SHA" \
+      '{reviewed_sha: $sha, critical_count: 0, critical_files: [],
+        overridden: true, overridden_by: $by, overridden_sha: $sha}')
+    NEW_BODY="${COMMENT_MARKER}"$'\n'"$(render_state_line "$NEW_STATE_JSON")"$'\n\n'"### 🤖 Claude Review"$'\n\n'"_✅ **Overridden by @${COMMENTER}** on $(today_utc) at commit \`${CURRENT_HEAD_SHA:0:8}\` — no prior review on this PR._"
+    post_new_comment "$PR_NUMBER" "$NEW_BODY"
+    post_status "$CURRENT_HEAD_SHA" success "Overridden by @${COMMENTER}"
+    exit 0
   else
     NEW_STATE_JSON=$(printf '%s' "$STATE" | jq -c \
       --arg by "@$COMMENTER" \

@@ -39,7 +39,7 @@ COMMENT_MARKER='<!-- claude-review:bot -->'
 STATE_MARKER_PREFIX='<!-- claude-review:state '
 STATE_MARKER_SUFFIX=' -->'
 STATUS_CONTEXT='ai-review'
-ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-sonnet-4-6}"
+ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-sonnet-5}"
 MAX_TOKENS="${MAX_TOKENS:-4096}"
 BOT_LOGIN_DEFAULT_FORGEJO='claude-reviewer'
 

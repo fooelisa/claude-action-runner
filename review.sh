@@ -40,7 +40,10 @@ STATE_MARKER_PREFIX='<!-- claude-review:state '
 STATE_MARKER_SUFFIX=' -->'
 STATUS_CONTEXT='ai-review'
 ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-sonnet-5}"
-MAX_TOKENS="${MAX_TOKENS:-4096}"
+# Thinking shares this budget with the response text on models that think
+# by default (Claude Sonnet 5 and later), so this is deliberately above what
+# the review text alone needs. Only tokens actually generated are billed.
+MAX_TOKENS="${MAX_TOKENS:-8192}"
 BOT_LOGIN_DEFAULT_FORGEJO='claude-reviewer'
 
 # --------------------------- env sanity ---------------------------
@@ -492,11 +495,32 @@ if [ "$HTTP_STATUS" != "200" ]; then
   exit 1
 fi
 
-MODEL_TEXT=$(jq -r '.content[0].text // ""' < "$API_RESPONSE")
+# Take the first text-typed block rather than content[0]. Models with thinking
+# enabled return a thinking block first, and on Claude Sonnet 5 adaptive thinking
+# is ON BY DEFAULT when the request omits the `thinking` parameter (Sonnet 4.6
+# ran thinking-off). Its `display` also defaults to "omitted", so that leading
+# block carries an EMPTY thinking string - which is why `.content[0].text` came
+# back null and every review died as "empty content" the moment the default
+# model moved to Sonnet 5. Selecting by type is model-agnostic and stays correct
+# whichever block order a future model returns.
+MODEL_TEXT=$(jq -r '[.content[]? | select(.type == "text") | .text] | add // ""' < "$API_RESPONSE")
+STOP_REASON=$(jq -r '.stop_reason // ""' < "$API_RESPONSE")
 INPUT_TOKENS=$(jq -r '.usage.input_tokens // 0' < "$API_RESPONSE")
 OUTPUT_TOKENS=$(jq -r '.usage.output_tokens // 0' < "$API_RESPONSE")
+if [ -z "$MODEL_TEXT" ]; then
+  echo "--- content block types returned ---" >&2
+  jq -r '[.content[]?.type] | join(", ")' < "$API_RESPONSE" >&2
+fi
 rm -f "$API_RESPONSE"
-echo "usage: input=$INPUT_TOKENS output=$OUTPUT_TOKENS"
+echo "usage: input=$INPUT_TOKENS output=$OUTPUT_TOKENS stop_reason=$STOP_REASON"
+
+# max_tokens caps thinking AND response text together, so a long thinking pass
+# can truncate the JSON payload mid-object. That surfaces downstream as an
+# unparseable-JSON error, which reads like a prompt problem rather than a
+# budget one - name it here instead.
+if [ "$STOP_REASON" = "max_tokens" ]; then
+  echo "WARNING: response hit max_tokens ($MAX_TOKENS); thinking and output share this budget, so the review may be truncated." >&2
+fi
 
 if [ -z "$MODEL_TEXT" ]; then
   post_status "$CURRENT_HEAD_SHA" error "Empty model response — see logs"

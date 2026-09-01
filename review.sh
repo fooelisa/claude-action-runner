@@ -24,8 +24,10 @@
 #   GITHUB_EVENT_PATH    JSON file with full event payload
 #
 # Optional:
-#   ANTHROPIC_MODEL      defaults to claude-sonnet-4-6
-#   MAX_TOKENS           defaults to 4096
+#   ANTHROPIC_MODEL      defaults to claude-sonnet-5
+#   MAX_TOKENS           defaults to 16000 (covers thinking AND response text)
+#   EFFORT               thinking depth: low|medium|high|xhigh|max. Defaults to
+#                        medium; see the config block for why it is set at all.
 #   BOT_LOGIN            username of the bot account posting comments;
 #                        used to skip self-triggering. Defaults to
 #                        claude-reviewer (Forgejo) or the workflow actor
@@ -40,10 +42,22 @@ STATE_MARKER_PREFIX='<!-- claude-review:state '
 STATE_MARKER_SUFFIX=' -->'
 STATUS_CONTEXT='ai-review'
 ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-sonnet-5}"
-# Thinking shares this budget with the response text on models that think
-# by default (Claude Sonnet 5 and later), so this is deliberately above what
-# the review text alone needs. Only tokens actually generated are billed.
-MAX_TOKENS="${MAX_TOKENS:-8192}"
+# max_tokens is a hard cap on thinking AND response text combined, and there is
+# no separate thinking budget to set: `budget_tokens` was removed on Sonnet 5 /
+# Opus 4.7+ and now returns a 400. So the only two levers are this budget and
+# `effort`, and both are set explicitly rather than left to model defaults.
+#
+# Why that matters here: on Sonnet 4.6 a request that omitted `thinking` ran
+# thinking-OFF, so the review text had the whole budget to itself. Sonnet 5
+# flipped that default to adaptive-ON at effort `high`. Bumping the model in
+# 05286d5 therefore silently introduced a thinking pass nothing accounted for,
+# and on 2026-08-31 it consumed all 8192 tokens before emitting a single text
+# block: stop_reason=max_tokens, content=[thinking], review dead. Only tokens
+# actually generated are billed, so a generous ceiling costs nothing.
+MAX_TOKENS="${MAX_TOKENS:-16000}"
+# `medium` on Sonnet 5 is roughly Sonnet 4.6 at `high` — ample for reviewing a
+# diff, and well clear of the budget. The model default is `high`.
+EFFORT="${EFFORT:-medium}"
 BOT_LOGIN_DEFAULT_FORGEJO='claude-reviewer'
 
 # --------------------------- env sanity ---------------------------
@@ -474,68 +488,99 @@ ${FILTERED_DIFF}
 EOF
 )
 
-REQUEST_BODY=$(jq -n \
-  --arg model "$ANTHROPIC_MODEL" \
-  --argjson max_tokens "$MAX_TOKENS" \
-  --arg system "$SYSTEM_PROMPT" \
-  --arg user "$USER_MESSAGE" \
-  '{
-    model: $model,
-    max_tokens: $max_tokens,
-    system: $system,
-    messages: [{role: "user", content: $user}]
-  }')
+API_RESPONSE=$(mktemp)
+trap 'rm -f "$API_RESPONSE"' EXIT
+# Set when the review had to fall back to a thinking-disabled retry; noted in
+# the posted comment so nobody reads a shallow review as a thorough one.
+DEGRADED_REVIEW=0
 
-# Heartbeat during Anthropic call
-( while sleep 30; do echo "…still waiting on anthropic ($(date -u +%H:%M:%SZ))"; done ) &
-HEARTBEAT_PID=$!
-trap 'kill $HEARTBEAT_PID 2>/dev/null || true' EXIT
+# One Anthropic call. $1 is a JSON object merged over the base request, so a
+# caller can override any field (used by the retry below).
+call_anthropic() {
+  local extra="$1" body heartbeat_pid
+
+  body=$(jq -n \
+    --arg model "$ANTHROPIC_MODEL" \
+    --argjson max_tokens "$MAX_TOKENS" \
+    --arg effort "$EFFORT" \
+    --arg system "$SYSTEM_PROMPT" \
+    --arg user "$USER_MESSAGE" \
+    --argjson extra "$extra" \
+    '{
+      model: $model,
+      max_tokens: $max_tokens,
+      output_config: {effort: $effort},
+      system: $system,
+      messages: [{role: "user", content: $user}]
+    } + $extra')
+
+  # Heartbeat so a long thinking pass does not look like a hung job.
+  ( while sleep 30; do echo "…still waiting on anthropic ($(date -u +%H:%M:%SZ))"; done ) &
+  heartbeat_pid=$!
+  printf '%s' "$body" | curl -sS -o "$API_RESPONSE" -w '%{http_code}' \
+    -X POST https://api.anthropic.com/v1/messages \
+    -H "x-api-key: $ANTHROPIC_API_KEY" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    --data-binary @-
+  kill "$heartbeat_pid" 2>/dev/null || true
+}
+
+# Fail the run on any non-200; the body carries the API's own error message.
+require_http_200() {
+  if [ "$1" != "200" ]; then
+    echo "ERROR: Anthropic API returned HTTP $1" >&2
+    echo "--- response body ---" >&2
+    cat "$API_RESPONSE" >&2
+    post_status "$CURRENT_HEAD_SHA" error "Anthropic API HTTP $1 — see logs"
+    exit 1
+  fi
+}
+
+# Concatenate every text-typed block rather than reading content[0]. Models
+# with thinking enabled return a thinking block first, and its `display`
+# defaults to "omitted" — so that leading block carries an EMPTY thinking
+# string, which is why `.content[0].text` came back null and every review died
+# as "empty content" the moment the default model moved to Sonnet 5. Selecting
+# by type is model-agnostic and stays correct whichever order a model returns.
+read_response() {
+  MODEL_TEXT=$(jq -r '[.content[]? | select(.type == "text") | .text] | add // ""' < "$API_RESPONSE")
+  STOP_REASON=$(jq -r '.stop_reason // ""' < "$API_RESPONSE")
+  INPUT_TOKENS=$(jq -r '.usage.input_tokens // 0' < "$API_RESPONSE")
+  OUTPUT_TOKENS=$(jq -r '.usage.output_tokens // 0' < "$API_RESPONSE")
+  echo "usage: input=$INPUT_TOKENS output=$OUTPUT_TOKENS stop_reason=$STOP_REASON"
+  if [ -z "$MODEL_TEXT" ]; then
+    echo "--- content block types returned ---" >&2
+    jq -r '[.content[]?.type] | join(", ")' < "$API_RESPONSE" >&2
+  fi
+}
 
 echo "::group::anthropic call"
-API_RESPONSE=$(mktemp)
-HTTP_STATUS=$(printf '%s' "$REQUEST_BODY" | curl -sS -o "$API_RESPONSE" -w '%{http_code}' \
-  -X POST https://api.anthropic.com/v1/messages \
-  -H "x-api-key: $ANTHROPIC_API_KEY" \
-  -H "anthropic-version: 2023-06-01" \
-  -H "content-type: application/json" \
-  --data-binary @-)
+HTTP_STATUS=$(call_anthropic '{}')
 echo "::endgroup::"
-kill $HEARTBEAT_PID 2>/dev/null || true
+require_http_200 "$HTTP_STATUS"
+read_response
 
-if [ "$HTTP_STATUS" != "200" ]; then
-  echo "ERROR: Anthropic API returned HTTP $HTTP_STATUS" >&2
-  echo "--- response body ---" >&2
-  cat "$API_RESPONSE" >&2
-  post_status "$CURRENT_HEAD_SHA" error "Anthropic API HTTP $HTTP_STATUS — see logs"
-  rm -f "$API_RESPONSE"
-  exit 1
+# Thinking consumed the whole budget before producing any text. Retrying with a
+# bigger budget would be a guess at how much is enough; disabling thinking is
+# deterministic and still yields a real review rather than a red X. Effort is
+# forced to `low` too — on Opus 5, disabled thinking above `high` is a 400.
+if [ -z "$MODEL_TEXT" ] && [ "$STOP_REASON" = "max_tokens" ]; then
+  echo "WARNING: thinking used the entire ${MAX_TOKENS}-token budget before any text block." >&2
+  echo "Retrying once with thinking disabled — the review will be shallower than usual." >&2
+  echo "::group::anthropic call (retry, thinking disabled)"
+  HTTP_STATUS=$(call_anthropic '{"thinking": {"type": "disabled"}, "output_config": {"effort": "low"}}')
+  echo "::endgroup::"
+  require_http_200 "$HTTP_STATUS"
+  read_response
+  DEGRADED_REVIEW=1
 fi
 
-# Take the first text-typed block rather than content[0]. Models with thinking
-# enabled return a thinking block first, and on Claude Sonnet 5 adaptive thinking
-# is ON BY DEFAULT when the request omits the `thinking` parameter (Sonnet 4.6
-# ran thinking-off). Its `display` also defaults to "omitted", so that leading
-# block carries an EMPTY thinking string - which is why `.content[0].text` came
-# back null and every review died as "empty content" the moment the default
-# model moved to Sonnet 5. Selecting by type is model-agnostic and stays correct
-# whichever block order a future model returns.
-MODEL_TEXT=$(jq -r '[.content[]? | select(.type == "text") | .text] | add // ""' < "$API_RESPONSE")
-STOP_REASON=$(jq -r '.stop_reason // ""' < "$API_RESPONSE")
-INPUT_TOKENS=$(jq -r '.usage.input_tokens // 0' < "$API_RESPONSE")
-OUTPUT_TOKENS=$(jq -r '.usage.output_tokens // 0' < "$API_RESPONSE")
-if [ -z "$MODEL_TEXT" ]; then
-  echo "--- content block types returned ---" >&2
-  jq -r '[.content[]?.type] | join(", ")' < "$API_RESPONSE" >&2
-fi
-rm -f "$API_RESPONSE"
-echo "usage: input=$INPUT_TOKENS output=$OUTPUT_TOKENS stop_reason=$STOP_REASON"
-
-# max_tokens caps thinking AND response text together, so a long thinking pass
-# can truncate the JSON payload mid-object. That surfaces downstream as an
-# unparseable-JSON error, which reads like a prompt problem rather than a
-# budget one - name it here instead.
-if [ "$STOP_REASON" = "max_tokens" ]; then
-  echo "WARNING: response hit max_tokens ($MAX_TOKENS); thinking and output share this budget, so the review may be truncated." >&2
+# Text came back but was cut off mid-object. Surface it here — downstream this
+# only shows up as an unparseable-JSON error, which reads like a prompt problem
+# rather than a budget one.
+if [ -n "$MODEL_TEXT" ] && [ "$STOP_REASON" = "max_tokens" ]; then
+  echo "WARNING: response hit max_tokens ($MAX_TOKENS); the review may be truncated." >&2
 fi
 
 if [ -z "$MODEL_TEXT" ]; then
@@ -594,6 +639,11 @@ if [ "$CRITICAL_COUNT" -gt 0 ]; then
   BLOCK_FOOTER=$'\n\n'"_⛔ **Merge blocked**: ${CRITICAL_COUNT} Critical finding(s). Resolve them, or override with \`/override-ai-review\`._"
 fi
 
+DEGRADED_NOTE=""
+if [ "$DEGRADED_REVIEW" = "1" ]; then
+  DEGRADED_NOTE=" ⚠️ Thinking exhausted the token budget; this review ran with thinking disabled and is shallower than usual."
+fi
+
 NEW_BODY=$(cat <<EOF
 ${COMMENT_MARKER}
 ${NEW_STATE_LINE}
@@ -605,7 +655,7 @@ $(render_bucket warnings    "🟡" "Warnings")
 $(render_bucket suggestions "🔵" "Suggestions")
 $(render_bucket nits        "⚪" "Nits")
 
-_Reviewed commit \`${CURRENT_HEAD_SHA:0:8}\` · model \`${ANTHROPIC_MODEL}\` · ${INPUT_TOKENS} in / ${OUTPUT_TOKENS} out tokens._
+_Reviewed commit \`${CURRENT_HEAD_SHA:0:8}\` · model \`${ANTHROPIC_MODEL}\` · ${INPUT_TOKENS} in / ${OUTPUT_TOKENS} out tokens.${DEGRADED_NOTE}_
 _Re-review: comment \`/review\` · Override block: \`/override-ai-review\`_${BLOCK_FOOTER}
 EOF
 )

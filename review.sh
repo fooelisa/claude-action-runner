@@ -514,8 +514,10 @@ call_anthropic() {
       messages: [{role: "user", content: $user}]
     } + $extra')
 
-  # Heartbeat so a long thinking pass does not look like a hung job.
-  ( while sleep 30; do echo "…still waiting on anthropic ($(date -u +%H:%M:%SZ))"; done ) &
+  # Heartbeat so a long thinking pass does not look like a hung job. It MUST
+  # write to stderr: this function's stdout is captured by the caller as the
+  # HTTP status, so an echo here lands inside $HTTP_STATUS and corrupts it.
+  ( while sleep 30; do echo "…still waiting on anthropic ($(date -u +%H:%M:%SZ))" >&2; done ) &
   heartbeat_pid=$!
   printf '%s' "$body" | curl -sS -o "$API_RESPONSE" -w '%{http_code}' \
     -X POST https://api.anthropic.com/v1/messages \
@@ -528,6 +530,14 @@ call_anthropic() {
 
 # Fail the run on any non-200; the body carries the API's own error message.
 require_http_200() {
+  # Anything but three digits means the status was corrupted on the way here
+  # (see the heartbeat note above) rather than the API returning an error.
+  # Fail loudly on that instead of reporting nonsense as an API status.
+  if ! printf '%s' "$1" | grep -qE '^[0-9]{3}$'; then
+    echo "ERROR: expected an HTTP status code, got: $1" >&2
+    post_status "$CURRENT_HEAD_SHA" error "Internal error capturing API status — see logs"
+    exit 1
+  fi
   if [ "$1" != "200" ]; then
     echo "ERROR: Anthropic API returned HTTP $1" >&2
     echo "--- response body ---" >&2

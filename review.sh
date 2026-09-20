@@ -453,7 +453,7 @@ FILTERED_DIFF=$(printf '%s\n' "$RAW_DIFF" | awk '
   }
   keep { print }
 ')
-DIFF_BYTES=$(printf %s "$FILTERED_DIFF" | wc -c)
+DIFF_BYTES=$(printf %s "$FILTERED_DIFF" | wc -c | tr -d " ")
 echo "diff bytes after filter: $DIFF_BYTES (cap $MAX_DIFF_BYTES)"
 
 # skip_review REASON DESC — used for empty/too-large diffs
@@ -473,7 +473,7 @@ if [ "$DIFF_BYTES" -gt "$MAX_DIFF_BYTES" ]; then
   skip_review "_Diff too large for AI review (${DIFF_BYTES} bytes > ${MAX_DIFF_BYTES} cap after filtering)._" \
               "Skipped — diff too large"
 fi
-if [ "$DIFF_CHARS" -eq 0 ]; then
+if [ "$DIFF_BYTES" -eq 0 ]; then
   skip_review "_No reviewable changes after filtering (lockfiles / generated / vendored files skipped)._" \
               "Skipped — empty diff"
 fi
@@ -497,7 +497,7 @@ fi
 # -- an error that says nothing about the real cause. Observed 2026-09-20 on a
 # 126495-char diff that measured 132713 bytes. --rawfile reads from a file
 # descriptor and has no such limit.
-USER_MESSAGE_FILE=$(mktemp)
+USER_MESSAGE_FILE=$(mktemp) || { echo "ERROR: mktemp failed for the user message" >&2; exit 1; }
 cat > "$USER_MESSAGE_FILE" <<EOF
 <pr-title>${PR_TITLE}</pr-title>
 <pr-description>

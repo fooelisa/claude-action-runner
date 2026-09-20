@@ -36,7 +36,16 @@
 set -euo pipefail
 
 # --------------------------- config ---------------------------
-MAX_DIFF_CHARS=150000
+# Cap the diff in BYTES, not characters.
+#
+# This used to be 150000 CHARS while the real constraint is the kernel's
+# MAX_ARG_STRLEN (32 * PAGE_SIZE = 131072 BYTES) on a single argv entry. The
+# two diverge as soon as the diff contains multi-byte UTF-8 -- an em dash or an
+# arrow is 3 bytes -- so a 126495-char diff measured 132713 bytes, sailed under
+# the char cap, and then killed jq with E2BIG. See the note above call_anthropic.
+#
+# 120000 leaves headroom under 131072 for the prompt wrapper around the diff.
+MAX_DIFF_BYTES=120000
 COMMENT_MARKER='<!-- claude-review:bot -->'
 STATE_MARKER_PREFIX='<!-- claude-review:state '
 STATE_MARKER_SUFFIX=' -->'
@@ -444,8 +453,8 @@ FILTERED_DIFF=$(printf '%s\n' "$RAW_DIFF" | awk '
   }
   keep { print }
 ')
-DIFF_CHARS=${#FILTERED_DIFF}
-echo "diff chars after filter: $DIFF_CHARS (cap $MAX_DIFF_CHARS)"
+DIFF_BYTES=$(printf %s "$FILTERED_DIFF" | wc -c)
+echo "diff bytes after filter: $DIFF_BYTES (cap $MAX_DIFF_BYTES)"
 
 # skip_review REASON DESC — used for empty/too-large diffs
 skip_review() {
@@ -460,8 +469,8 @@ skip_review() {
   exit 0
 }
 
-if [ "$DIFF_CHARS" -gt "$MAX_DIFF_CHARS" ]; then
-  skip_review "_Diff too large for AI review (${DIFF_CHARS} chars > ${MAX_DIFF_CHARS} cap after filtering)._" \
+if [ "$DIFF_BYTES" -gt "$MAX_DIFF_BYTES" ]; then
+  skip_review "_Diff too large for AI review (${DIFF_BYTES} bytes > ${MAX_DIFF_BYTES} cap after filtering)._" \
               "Skipped — diff too large"
 fi
 if [ "$DIFF_CHARS" -eq 0 ]; then
@@ -476,8 +485,20 @@ if [ ! -f "$SYSTEM_PROMPT_FILE" ]; then
   echo "ERROR: system prompt file not found at $SYSTEM_PROMPT_FILE" >&2
   exit 1
 fi
-SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
-USER_MESSAGE=$(cat <<EOF
+# Both the system prompt and the user message go to jq via --rawfile, never
+# --arg. A single argv entry is capped at MAX_ARG_STRLEN (32 * PAGE_SIZE =
+# 131072 bytes on Linux), and the diff routinely approaches that. Exceeding it
+# kills jq with "Argument list too long", jq then emits nothing, and the empty
+# body is POSTed to Anthropic, which answers:
+#
+#   400 "The request body is not valid JSON: Input is a zero-length, empty
+#        document"
+#
+# -- an error that says nothing about the real cause. Observed 2026-09-20 on a
+# 126495-char diff that measured 132713 bytes. --rawfile reads from a file
+# descriptor and has no such limit.
+USER_MESSAGE_FILE=$(mktemp)
+cat > "$USER_MESSAGE_FILE" <<EOF
 <pr-title>${PR_TITLE}</pr-title>
 <pr-description>
 ${PR_BODY}
@@ -486,10 +507,12 @@ ${PR_BODY}
 ${FILTERED_DIFF}
 </diff>
 EOF
-)
 
 API_RESPONSE=$(mktemp)
-trap 'rm -f "$API_RESPONSE"' EXIT
+# ONE trap for both temp files: a second `trap ... EXIT` replaces the first
+# rather than adding to it, so registering them separately would silently leak
+# whichever was registered earlier.
+trap 'rm -f "$API_RESPONSE" "$USER_MESSAGE_FILE"' EXIT
 # Set when the review had to fall back to a thinking-disabled retry; noted in
 # the posted comment so nobody reads a shallow review as a thorough one.
 DEGRADED_REVIEW=0
@@ -499,12 +522,15 @@ DEGRADED_REVIEW=0
 call_anthropic() {
   local extra="$1" body heartbeat_pid
 
+  # --rawfile, NOT --arg, for system and user: see the note where
+  # USER_MESSAGE_FILE is built. These are the two values large enough to blow
+  # past the kernel's per-argument limit.
   body=$(jq -n \
     --arg model "$ANTHROPIC_MODEL" \
     --argjson max_tokens "$MAX_TOKENS" \
     --arg effort "$EFFORT" \
-    --arg system "$SYSTEM_PROMPT" \
-    --arg user "$USER_MESSAGE" \
+    --rawfile system "$SYSTEM_PROMPT_FILE" \
+    --rawfile user "$USER_MESSAGE_FILE" \
     --argjson extra "$extra" \
     '{
       model: $model,

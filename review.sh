@@ -508,7 +508,7 @@ ${FILTERED_DIFF}
 </diff>
 EOF
 
-API_RESPONSE=$(mktemp)
+API_RESPONSE=$(mktemp) || { echo "ERROR: mktemp failed for the API response" >&2; exit 1; }
 # ONE trap for both temp files: a second `trap ... EXIT` replaces the first
 # rather than adding to it, so registering them separately would silently leak
 # whichever was registered earlier.

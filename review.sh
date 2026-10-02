@@ -625,6 +625,12 @@ if [ -z "$MODEL_TEXT" ]; then
   exit 1
 fi
 
+# Raw model output in the log. Without it the #220 empty-suggestion bug could
+# only be inferred from a jq error; the review is posted publicly anyway.
+echo "::group::model output"
+printf '%s\n' "$MODEL_TEXT"
+echo "::endgroup::"
+
 # Strip common fences and parse
 JSON_PAYLOAD=$(printf '%s' "$MODEL_TEXT" \
   | sed -e 's/^```json//' -e 's/^```//' -e 's/```$//' \
@@ -637,12 +643,50 @@ if [ -z "$JSON_PAYLOAD" ]; then
   exit 1
 fi
 
+# Coerce every finding into {file, line, body} before anything reads it.
+#
+# The prompt asks for objects, but the model does not always comply: it has
+# returned bare strings (PRs #177, #204, #220 on pik8s). render_bucket then ran
+# `.line` on a string, jq aborted inside $(...), the script carried on, and the
+# comment went out with "Suggestions (1)" and nothing under it -- the finding
+# silently lost. A malformed Critical would also have broken the critical_files
+# list that drives the auto-address check. A string becomes the body; any other
+# shape is kept as its JSON text, so a finding can never vanish.
+#
+# A payload that is not an object at all is rejected explicitly and takes the
+# loud error path below rather than rendering an empty review. Fallback bodies
+# are capped at 500 chars so an odd shape cannot flood the comment.
+NORMALIZE_FINDINGS='
+  def clip: if length > 500 then .[0:500] + "…" else . end;
+  def normalize_finding:
+    if type == "object" then
+      { file: (.file // null),
+        line: (.line // null),
+        body: (.body // .message // .text // (del(.file, .line) | tojson | clip)) }
+    elif type == "string" then { file: null, line: null, body: . }
+    else { file: null, line: null, body: (tojson | clip) }
+    end;
+  if type != "object" then error("review payload is a \(type), not an object") else . end |
+  reduce ("critical", "warnings", "suggestions", "nits") as $k (.;
+    .[$k] = ((.[$k] // []) | if type == "array" then map(normalize_finding) else [normalize_finding] end))'
+if [ -n "$JSON_PAYLOAD" ]; then
+  # stderr is NOT suppressed: if this fails, the jq error is the diagnostic.
+  JSON_PAYLOAD=$(printf '%s' "$JSON_PAYLOAD" | jq -c "$NORMALIZE_FINDINGS" || true)
+fi
+
+if [ -z "$JSON_PAYLOAD" ]; then
+  post_status "$CURRENT_HEAD_SHA" error "Model output not a review object — see logs"
+  echo "ERROR: model output was JSON but not a review object:" >&2
+  printf '%s' "$MODEL_TEXT" | head -c 2000 >&2
+  exit 1
+fi
+
 # Extract counts + critical_files for the state marker
 CRITICAL_COUNT=$(printf '%s' "$JSON_PAYLOAD" | jq -r '.critical // [] | length')
 WARNINGS_COUNT=$(printf '%s' "$JSON_PAYLOAD" | jq -r '.warnings // [] | length')
 SUGGESTIONS_COUNT=$(printf '%s' "$JSON_PAYLOAD" | jq -r '.suggestions // [] | length')
 NITS_COUNT=$(printf '%s' "$JSON_PAYLOAD" | jq -r '.nits // [] | length')
-CRITICAL_FILES_JSON=$(printf '%s' "$JSON_PAYLOAD" | jq -c '[.critical[]?.file] | unique')
+CRITICAL_FILES_JSON=$(printf '%s' "$JSON_PAYLOAD" | jq -c '[.critical[].file | select(. != null)] | unique')
 
 NEW_STATE_JSON=$(jq -cn \
   --argjson cc "$CRITICAL_COUNT" \
@@ -663,9 +707,10 @@ render_bucket() {
   printf '\n**%s %s (%s)**\n' "$emoji" "$name" "$n"
   printf '%s' "$JSON_PAYLOAD" | jq -r --arg k "$key" '
     .[$k][] |
-    if .line then "- `\(.file):\(.line)` — \(.body)"
-    else       "- `\(.file)` — \(.body)"
-    end'
+    if .file == null then "- \(.body)"
+    elif .line then "- `\(.file):\(.line)` — \(.body)"
+    else            "- `\(.file)` — \(.body)"
+    end' || echo "- _(findings could not be rendered — see the workflow log)_"
 }
 
 SUMMARY=$(printf '%s' "$JSON_PAYLOAD" | jq -r '.summary // "(no summary)"')

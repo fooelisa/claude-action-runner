@@ -657,17 +657,18 @@ fi
 # loud error path below rather than rendering an empty review. Fallback bodies
 # are capped at 500 chars so an odd shape cannot flood the comment.
 NORMALIZE_FINDINGS='
-  def finding:
+  def clip: if length > 500 then .[0:500] + "…" else . end;
+  def normalize_finding:
     if type == "object" then
       { file: (.file // null),
         line: (.line // null),
-        body: (.body // .message // .text // (del(.file, .line) | tojson | .[0:500])) }
+        body: (.body // .message // .text // (del(.file, .line) | tojson | clip)) }
     elif type == "string" then { file: null, line: null, body: . }
-    else { file: null, line: null, body: (tojson | .[0:500]) }
+    else { file: null, line: null, body: (tojson | clip) }
     end;
   if type != "object" then error("review payload is a \(type), not an object") else . end |
   reduce ("critical", "warnings", "suggestions", "nits") as $k (.;
-    .[$k] = ((.[$k] // []) | if type == "array" then map(finding) else [finding] end))'
+    .[$k] = ((.[$k] // []) | if type == "array" then map(normalize_finding) else [normalize_finding] end))'
 if [ -n "$JSON_PAYLOAD" ]; then
   # stderr is NOT suppressed: if this fails, the jq error is the diagnostic.
   JSON_PAYLOAD=$(printf '%s' "$JSON_PAYLOAD" | jq -c "$NORMALIZE_FINDINGS" || true)

@@ -653,21 +653,24 @@ fi
 # list that drives the auto-address check. A string becomes the body; any other
 # shape is kept as its JSON text, so a finding can never vanish.
 #
-# A payload that is not an object at all fails here and takes the loud
-# "not JSON" path below rather than rendering an empty review.
+# A payload that is not an object at all is rejected explicitly and takes the
+# loud error path below rather than rendering an empty review. Fallback bodies
+# are capped at 500 chars so an odd shape cannot flood the comment.
 NORMALIZE_FINDINGS='
   def finding:
     if type == "object" then
       { file: (.file // null),
         line: (.line // null),
-        body: (.body // .message // .text // (del(.file, .line) | tojson)) }
+        body: (.body // .message // .text // (del(.file, .line) | tojson | .[0:500])) }
     elif type == "string" then { file: null, line: null, body: . }
-    else { file: null, line: null, body: tojson }
+    else { file: null, line: null, body: (tojson | .[0:500]) }
     end;
+  if type != "object" then error("review payload is a \(type), not an object") else . end |
   reduce ("critical", "warnings", "suggestions", "nits") as $k (.;
     .[$k] = ((.[$k] // []) | if type == "array" then map(finding) else [finding] end))'
 if [ -n "$JSON_PAYLOAD" ]; then
-  JSON_PAYLOAD=$(printf '%s' "$JSON_PAYLOAD" | jq -c "$NORMALIZE_FINDINGS" 2>/dev/null || true)
+  # stderr is NOT suppressed: if this fails, the jq error is the diagnostic.
+  JSON_PAYLOAD=$(printf '%s' "$JSON_PAYLOAD" | jq -c "$NORMALIZE_FINDINGS" || true)
 fi
 
 if [ -z "$JSON_PAYLOAD" ]; then

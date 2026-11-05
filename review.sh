@@ -274,13 +274,15 @@ case "$GITHUB_EVENT_NAME" in
     PR_AUTHOR=$(printf '%s' "$EVENT_PAYLOAD" | jq -r '.pull_request.user.login // ""')
     case "$EVENT_ACTION" in
       opened|reopened) MODE=full ;;
-      synchronize)     MODE=synchronize ;;
+      # GitHub sends "synchronize", Forgejo/Gitea "synchronized"
+      synchronize|synchronized) MODE=synchronize ;;
       *) echo "ignoring pull_request action: $EVENT_ACTION"; echo "::endgroup::"; exit 0 ;;
     esac
     ;;
 
   issue_comment)
-    IS_PR=$(printf '%s' "$EVENT_PAYLOAD" | jq -r '.issue.pull_request.url // ""')
+    # GitHub sets issue.pull_request.url; Forgejo/Gitea only issue.pull_request.html_url
+    IS_PR=$(printf '%s' "$EVENT_PAYLOAD" | jq -r '.issue.pull_request.url // .issue.pull_request.html_url // ""')
     if [ -z "$IS_PR" ]; then
       echo "ignoring: comment on issue (not PR)"; echo "::endgroup::"; exit 0
     fi
